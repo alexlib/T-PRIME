@@ -100,15 +100,10 @@ parfor i = 1:M
 end
 
 %% ==== 4. Run T-PRIME ====================================================
-% NOTE: acc is negated here (DU/Dt convention flip between the PTV
-% acceleration-estimation pipeline and TPRIME's expected momentum-equation
-% sign convention). [Document the specific source of this sign flip here,
-% e.g. which script/step produces 'acc' with the opposite sign, so future
-% readers don't have to rediscover it.]
 [u_ss, gradU_ss, HessU_ss, gradP_ss, info] = TPRIME(positions_cln, u_neighbors, ...
-    -acc, positions_in_domain, neighborsCell_new, ...
+    acc, positions_in_domain, neighborsCell_new, ...
     'weights', 'inv2', 'Mu', rho*nu, 'MinNeighbors', MinNeighbors, ...
-    'UsePressureHessian', false, 'momScale', 1, 'DivFree', true, 'Loss', 'huber');
+    'DivFree', true, 'Loss', 'huber');
 
 %% ==== 5. Unpack results =================================================
 % Vectorized extraction (validated against the equivalent per-point loop to
