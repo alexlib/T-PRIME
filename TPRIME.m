@@ -14,13 +14,12 @@ function [u_s, gradU_s, HessU_s, gradP_s, info] = TPRIME(xp, up, accel, xs, neig
 %   Laplacian at origin: th(5)+th(8)+th(10)  
 
 opts = inputParser;
-opts.addParameter('Weights',            'gaussian');  % 'inv2'|'shepard'|'gaussian'
+opts.addParameter('Weights',            'gaussian');  % 'inv2'|'gaussian'
 opts.addParameter('DivFree',            false);       % hard div-free constraint
 opts.addParameter('LambdaVel',          1e-10);        % Tikhonov on velocity block
 opts.addParameter('LambdaP',            1e-10);        % Tikhonov on pressure block
 opts.addParameter('Rho',                1.0);         % density
 opts.addParameter('Mu',                 0.0);         % dynamic viscosity
-opts.addParameter('UsePressureHessian', false);       % include HessP terms
 opts.addParameter('MomScale',           1.0);         % weight on momentum equations
 opts.addParameter('BodyForce',          [0 0 0]);     % per-unit-mass body force
 opts.addParameter('MinNeighbors',       10);
@@ -29,7 +28,6 @@ opts.addParameter('Verbose',            false);
 opts.addParameter('Loss',               'L2');        % 'L2' or 'Huber'
 opts.addParameter('HuberDelta',         1.0);
 opts.addParameter('HuberDeltaAuto',     true);
-opts.addParameter('AllowFallback',      false);  % allow neighbor expansion and fallback
 opts.parse(varargin{:});
 
 wmethod    = lower(opts.Results.Weights);
@@ -37,7 +35,6 @@ lambdaVel  = opts.Results.LambdaVel;
 lambdaP    = opts.Results.LambdaP;
 rho        = opts.Results.Rho;
 mu         = opts.Results.Mu;
-useHp      = opts.Results.UsePressureHessian;
 momScale   = opts.Results.MomScale;
 fvec       = opts.Results.BodyForce(:).';
 minK       = opts.Results.MinNeighbors;
@@ -55,7 +52,6 @@ u_s     = NaN(Ns, 3);
 gradU_s = NaN(3, 3, Ns);
 HessU_s = NaN(3, 3, 3, Ns);
 gradP_s = NaN(Ns, 3);
-HessP_s = NaN(3, 3, Ns);
 
 info_Nused            = zeros(Ns, 1);
 info_rankA            = NaN(Ns, 1);
@@ -75,28 +71,15 @@ parfor i = 1:Ns
     idxAll = neighbors{i};
     if isempty(idxAll), continue; end
     % Preinitialize all variables that parfor warns about
-    % w          = zeros(0,1);
     Phi10      = zeros(0,10);
     Phi4       = zeros(0,4);
     A_div      = zeros(1, 0);
-    % ATA        = zeros(0,0);
-    % theta      = zeros(0,1);
     huberDelta = opts.Results.HuberDelta;  % use the parsed value as default
-
-    % Local copies of per-point variables
-    % lv = lambdaVel;
-    % lp = lambdaP;
-    % 
-    % triedAffine = false;
-    % triedNoHp   = ~useHp;
-    % flag        = "";
-
 
     k   = min(numel(idxAll), minK);
     idx = idxAll(1:k);
 
     triedAffine = false;
-    triedNoHp   = ~useHp;
     flag        = "";
 
     lv = lambdaVel;
@@ -111,23 +94,13 @@ parfor i = 1:Ns
         di = vecnorm(dX, 2, 2);
 
         % ------------------------------------------------------------------
-        % Spatial weights
+        % Spatial weights (inverse-distance-squared or Gaussian, matching
+        % the two forms in the paper's Eq. (5)/(6) -- both are actively
+        % used and compared, see Fig. 4b)
         % ------------------------------------------------------------------
         switch wmethod
             case 'inv2'
                 w = 1 ./ max(di, 1e-12).^2;
-
-            case 'shepard'
-                r  = 2.0 * median(di + (di==0).*median(di));
-                q  = di / max(r, eps);
-                in = q < 1;
-                w  = zeros(m, 1);
-                if any(in)
-                    w(in) = 1./max(di(in),1e-12).^2.5 .* (1-q(in)).^2;
-                else
-                    [~,ord] = sort(di);
-                    w(ord(1:min(6,m))) = 1;
-                end
 
             case 'gaussian'
                 s     = std(di);
@@ -135,7 +108,7 @@ parfor i = 1:Ns
                 w     = exp(-(di./sigma).^2);
 
             otherwise
-                error('Unknown Weights: %s', wmethod);
+                error('Unknown Weights: %s (supported: ''inv2'', ''gaussian'')', wmethod);
         end
         w  = w / (sum(w) + eps);
         Wm = diag(sqrt(w));
@@ -160,12 +133,8 @@ parfor i = 1:Ns
             basisPerComp = 4;
         end
 
-        if ~triedNoHp && useHp
-            nPcols = 9;
-        else
-            nPcols = 3;
-        end
-        nCols = nVelCols + nPcols;
+        nPcols = 3;   % pressure-gradient-only (matches paper: n = 30 vel + 3 pressure = 33)
+        nCols  = nVelCols + nPcols;
 
         % ------------------------------------------------------------------
         % Velocity equations (3m rows)
@@ -196,7 +165,17 @@ parfor i = 1:Ns
         % Momentum equations (3m rows)
         %
         % Navier-Stokes: rho*DU/Dt = -gradP + mu*Lap(U) + rho*f
-        % Rearranged:    -gradP + mu*Lap(U) - rho*accel + rho*f = 0
+        % Rearranged:    -gradP + mu*Lap(U) = rho*accel - rho*f
+        %
+        % i.e. the row [-dp/dx-coeff, mu*Lap-coeffs] * theta = b_mom, with
+        % b_mom = rho*accel - rho*f. accel is expected in the STANDARD
+        % DU/Dt convention (material acceleration, same sign as the LHS
+        % of Navier-Stokes above) -- no sign compensation should be
+        % needed by callers. (Fixed: an earlier version had b_mom with
+        % the opposite sign from this derivation, silently compensated
+        % for by negating accel before calling this function; if you
+        % have code that negates its acceleration input before calling
+        % TPRIME, remove that negation now.)
         %
         % Laplacian from quadratic basis (FIX 3):
         %   Lap(u) = d^2u/dx^2 + d^2u/dy^2 + d^2u/dz^2
@@ -211,46 +190,35 @@ parfor i = 1:Ns
         b_mom = zeros(3*m, 1);
 
         for krow = 1:m
-            dx = dX(krow,:).';
-
             % x-momentum
             row = krow;
             A_mom(row, nVelCols+1) = -1;                       % -dp/dx
-            if ~triedNoHp && useHp
-                A_mom(row, nVelCols+4 : nVelCols+6) = -dx.';  % -Hp(1,:)*dx
-            end
             if ~useAffineVel
                 A_mom(row, [5 8 10]) = mu;                     % mu*Lap(u)
             end
-            b_mom(row) = -rho*Ai(krow,1) + rho*fvec(1);
+            b_mom(row) = rho*Ai(krow,1) - rho*fvec(1);
 
             % y-momentum
             row = m + krow;
             A_mom(row, nVelCols+2) = -1;                       % -dp/dy
-            if ~triedNoHp && useHp
-                A_mom(row, nVelCols+[5 7 8]) = -dx.';
-            end
             if ~useAffineVel
                 % cols: 10+5=15, 10+8=18, 10+10=20
                 A_mom(row, 15) = A_mom(row,15) + mu;           % mu*Lap(v)
                 A_mom(row, 18) = A_mom(row,18) + mu;
                 A_mom(row, 20) = A_mom(row,20) + mu;
             end
-            b_mom(row) = -rho*Ai(krow,2) + rho*fvec(2);
+            b_mom(row) = rho*Ai(krow,2) - rho*fvec(2);
 
             % z-momentum
             row = 2*m + krow;
             A_mom(row, nVelCols+3) = -1;                       % -dp/dz
-            if ~triedNoHp && useHp
-                A_mom(row, nVelCols+[6 8 9]) = -dx.';
-            end
             if ~useAffineVel
                 % cols: 20+5=25, 20+8=28, 20+10=30
                 A_mom(row, 25) = A_mom(row,25) + mu;           % mu*Lap(w)
                 A_mom(row, 28) = A_mom(row,28) + mu;
                 A_mom(row, 30) = A_mom(row,30) + mu;
             end
-            b_mom(row) = -rho*Ai(krow,3) + rho*fvec(3);
+            b_mom(row) = rho*Ai(krow,3) - rho*fvec(3);
         end
 
         % Spatially weighted + scaled momentum block
@@ -268,16 +236,14 @@ parfor i = 1:Ns
         if lv > 0
             Rv = zeros(nVelCols, nCols);
             reg_diag = ones(nVelCols, 1) * sqrt(lv);
-            
+
             if ~useAffineVel
-                % Quadratic basis: selective regularization
                 grad_cols = [2,3,4, 12,13,14, 22,23,24];
                 quad_cols = [5:10, 15:20, 25:30];
                 reg_diag(grad_cols) = sqrt(lv * 0.1);
                 reg_diag(quad_cols) = sqrt(lv * 10);
             end
-            % Affine basis: reg_diag stays uniform sqrt(lv) — only 12 elements, no quad terms
-            
+
             Rv(:, 1:nVelCols) = diag(reg_diag);
         else
             Rv = zeros(0, nCols);
@@ -384,7 +350,7 @@ parfor i = 1:Ns
                         if dtheta < tolIRLS && dw < tolIRLS, break; end
                     end
                     info_huber_iterations(i) = it;
-                    info_outliers(i) = sum(abs(Adata*theta - bdata) > huberDelta);
+                    info_n_outliers(i) = sum(abs(Adata*theta - bdata) > huberDelta);
 
                 otherwise
                     error('Unknown Loss: %s', lossType);
@@ -455,25 +421,12 @@ parfor i = 1:Ns
         % Stability check & fallback
         % ------------------------------------------------------------------
         if rk < min(size(Adata,1)+size(Areg,1), nCols) || cd > maxCond
-            if opts.Results.AllowFallback && numel(idx) < numel(idxAll)
-                k   = min(numel(idxAll), numel(idx)+max(3,ceil(0.25*numel(idx))));
-                idx = idxAll(1:k);
-                if vb, fprintf('i=%d expanding to %d neighbors (rk=%d, cd=%.2e)\n',i,k,rk,cd); end
-                continue;
-            end
-            if ~triedNoHp && useHp
-                triedNoHp = true; flag = "NoHp";
-                if vb, fprintf('i=%d disabling HessP (rk=%d, cd=%.2e)\n',i,rk,cd); end
-                continue;
-            end
             if ~triedAffine
                 triedAffine = true; flag = flag + "+AffVel";
                 if vb, fprintf('i=%d downgrading to affine vel (rk=%d, cd=%.2e)\n',i,rk,cd); end
                 continue;
             end
-            % lv = max(lv, 1e-4);
-            % lp = max(lp, 1e-6);
-            if vb, fprintf('i=%d boosted regularization; accepting.\n',i); end
+            if vb, fprintf('i=%d accepting ill-conditioned/rank-deficient solution.\n',i); end
         end
 
         % ------------------------------------------------------------------
@@ -517,4 +470,4 @@ info.huber_iterations = info_huber_iterations;
 info.n_outliers       = info_n_outliers;
 info.huber_delta      = info_huber_delta;
 
-end  % main function
+end  
